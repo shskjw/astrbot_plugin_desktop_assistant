@@ -35,10 +35,7 @@ pip install -r astrbot_plugin_desktop_assistant/requirements.txt
 ```
 
 ## ⚙️ 配置说明
-安装后重启 AstrBot，在插件配置页面可调整以下参数：
-- **服务端口**：API 监听端口。
-- **主动对话**：开启/关闭基于屏幕内容的主动交互功能。
-- **监控间隔**：设置屏幕分析的时间间隔。
+安装后重启 AstrBot，插件无需配置。
 
 
 <img width="460" height="489" alt="PixPin_2025-12-22_17-01-45" src="https://github.com/user-attachments/assets/f8ed97ba-9ac5-48d3-a731-efe626717622" />
@@ -50,4 +47,5 @@ pip install -r astrbot_plugin_desktop_assistant/requirements.txt
 ## 📄 许可证
 
 本项目采用 MIT 许可证。
+
 
