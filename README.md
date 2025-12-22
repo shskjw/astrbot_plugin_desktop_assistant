@@ -5,7 +5,7 @@
 
 本插件是 [AstrBot 桌面助手客户端](https://github.com/muyouzhi6/Astrbot-desktop-assistant) 的服务端适配器，负责处理客户端连接、消息路由及多模态数据交互。
 
-> ⚠️ **注意**：本项目仅为服务端插件，需配合桌面客户端使用。
+> ⚠️ **注意**：本项目仅为服务端插件，需配合桌面客户端使用。初次安装本插件后重启Astrbot。
 
 ## ✨ 核心功能
 
@@ -40,5 +40,11 @@ pip install -r astrbot_plugin_desktop_assistant/requirements.txt
 - **主动对话**：开启/关闭基于屏幕内容的主动交互功能。
 - **监控间隔**：设置屏幕分析的时间间隔。
 
+
+<img width="460" height="489" alt="PixPin_2025-12-22_17-01-45" src="https://github.com/user-attachments/assets/f8ed97ba-9ac5-48d3-a731-efe626717622" />
+
+
+
 ## 📄 许可证
+
 本项目采用 MIT 许可证。
