@@ -209,6 +209,12 @@ class DesktopMonitorService:
     def get_all_client_states(self) -> Dict[str, DesktopState]:
         """获取所有客户端的桌面状态"""
         return self._client_states.copy()
+
+    def get_last_state(self, session_id: Optional[str] = None) -> Optional[DesktopState]:
+        """获取最新的桌面状态"""
+        if session_id:
+            return self._client_states.get(session_id)
+        return self._get_any_client_state()
             
     async def _safe_callback(self, callback: Callable, *args):
         """安全调用回调"""

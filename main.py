@@ -16,12 +16,14 @@ import traceback
 import uuid
 from typing import Optional
 
+import jwt
 from astrbot import logger
 from astrbot.api import star, llm_tool
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.event.filter import PermissionType
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context
+from astrbot.core.message.message_event_result import MessageEventResult, ResultContentType
 from astrbot.core.star.register import register_command
 from astrbot.core.platform import (
     AstrBotMessage,
@@ -66,6 +68,77 @@ WS_DEFAULT_HOST = "0.0.0.0"
 WS_DEFAULT_PORT = 6190
 
 
+def _message_chain_to_text(message) -> str:
+    """将消息链转换为纯文本，用于客户端显示
+    
+    兼容多种输入类型：
+    - str: 直接返回
+    - bytes/bytearray: 解码为 UTF-8
+    - MessageChain: 遍历 chain 提取文本
+    - 带有 text/content/message 属性的对象
+    - 其他类型: 尝试转换为字符串
+    """
+    if message is None:
+        return ""
+    
+    # 1) 直接字符串
+    if isinstance(message, str):
+        return message.strip()
+    
+    # 2) bytes/bytearray
+    if isinstance(message, (bytes, bytearray)):
+        try:
+            return message.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return ""
+    
+    # 3) MessageChain 兼容（有 chain 属性）
+    chain = getattr(message, "chain", None)
+    if chain:
+        parts = []
+        for comp in chain:
+            if isinstance(comp, Plain):
+                parts.append(comp.text)
+            elif isinstance(comp, Image):
+                parts.append("[图片]")
+            elif hasattr(comp, "text") and comp.text:
+                parts.append(str(comp.text))
+            elif hasattr(comp, "type"):
+                parts.append(f"[{comp.type}]")
+        result = "".join(parts).strip()
+        if result:
+            return result
+    
+    # 4) 常见字段名（适配各种消息格式）
+    for key in ("text", "content", "message", "plain_text"):
+        val = getattr(message, key, None)
+        if val is None and isinstance(message, dict):
+            val = message.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    
+    # 5) 尝试调用 get_plain_text 方法（AstrBot MessageChain 的方法）
+    if hasattr(message, "get_plain_text"):
+        try:
+            result = message.get_plain_text()
+            if isinstance(result, str) and result:
+                return result.strip()
+        except Exception:
+            pass
+    
+    # 6) 最后尝试转换为字符串（限制长度避免巨大对象）
+    try:
+        result = str(message)
+        # 避免返回类似 "<MessageChain object at 0x...>" 的无用字符串
+        # 也限制长度避免意外巨大对象
+        if result and len(result) < 100000 and not result.startswith("<") and not result.endswith(">"):
+            return result.strip()
+    except Exception:
+        pass
+    
+    return ""
+
+
 # ============================================================================
 # 插件主类
 # ============================================================================
@@ -87,10 +160,24 @@ class Main(star.Star):
         
         self.context = context
         self.config = config
+        self._jwt_secret = None
+        try:
+            dashboard_config = self.context.get_config().get("dashboard", {})
+            self._jwt_secret = dashboard_config.get("jwt_secret")
+        except Exception as e:
+            logger.error(f"读取 Dashboard JWT 配置失败: {e}")
         
         # 从配置中读取 WebSocket 服务器设置（如果有的话）
-        ws_host = WS_DEFAULT_HOST
-        ws_port = WS_DEFAULT_PORT
+        ws_host = config.get("ws_host", WS_DEFAULT_HOST)
+        ws_port = config.get("ws_port", WS_DEFAULT_PORT)
+        try:
+            ws_port = int(ws_port)
+        except (TypeError, ValueError):
+            logger.warning(f"无效的 ws_port 配置: {ws_port}，将使用默认端口 {WS_DEFAULT_PORT}")
+            ws_port = WS_DEFAULT_PORT
+        
+        # 声明使用全局变量
+        global ws_server
         
         # 创建 WebSocket 服务器
         ws_server = StandaloneWebSocketServer(
@@ -99,6 +186,7 @@ class Main(star.Star):
             on_client_connect=message_handler.on_client_connect,
             on_client_disconnect=message_handler.on_client_disconnect,
             on_message=message_handler.handle_message,
+            token_validator=self._validate_ws_token,
         )
         
         # 将服务器引用设置到客户端管理器
@@ -106,6 +194,11 @@ class Main(star.Star):
         
         # 设置配置同步回调
         message_handler.on_config_sync = self._handle_config_sync
+        # 设置聊天消息回调
+        message_handler.on_chat_message = self._handle_chat_message
+
+        # 同步截图保留配置
+        self._configure_screenshot_retention(config)
         
         # 从配置读取识图模式设置（直接从 config 读取，符合 _conf_schema.json 规范）
         vision_mode = config.get("vision_mode", "auto")
@@ -120,11 +213,87 @@ class Main(star.Star):
         
         logger.info("桌面悬浮球助手插件已加载（独立端口模式）")
         
+        # 手动创建并注册平台适配器实例
+        # 因为 PlatformManager.initialize() 在插件加载之前执行，
+        # 所以需要在这里手动创建适配器实例并添加到 platform_insts
+        try:
+            platform_config = {
+                "type": "desktop_assistant",
+                "enable": True,
+                "id": "desktop_assistant",
+                "ws_host": config.get("ws_host", WS_DEFAULT_HOST),
+                "ws_port": config.get("ws_port", WS_DEFAULT_PORT),
+            }
+            # 创建适配器实例
+            self._adapter = DesktopAssistantAdapter(
+                platform_config=platform_config,
+                event_queue=self.context.platform_manager.event_queue,
+            )
+            # 添加到平台实例列表
+            self.context.platform_manager.platform_insts.append(self._adapter)
+            logger.info("desktop_assistant 平台适配器已手动注册到 platform_insts")
+        except Exception as e:
+            logger.error(f"手动注册 desktop_assistant 平台适配器失败: {e}")
+        
         # 启动 WebSocket 服务器（在后台任务中启动）
         asyncio.create_task(self._start_ws_server())
         
         # 启动过期请求清理任务
         asyncio.create_task(client_manager.start_cleanup_task())
+
+    def _configure_screenshot_retention(self, config: dict):
+        """同步截图文件保留策略"""
+        max_screenshots = config.get("max_screenshots")
+        screenshot_max_age_hours = config.get("screenshot_max_age_hours")
+        client_manager.configure_screenshot_retention(
+            max_screenshots=max_screenshots,
+            max_age_hours=screenshot_max_age_hours,
+        )
+
+    async def _handle_chat_message(self, session_id: str, data: dict):
+        """处理客户端聊天消息"""
+        content = str(data.get("content", "")).strip()
+        image_base64 = data.get("image_base64")
+        image_path = None
+        if image_base64:
+            image_path = client_manager.save_base64_image(image_base64, "chat_image")
+        if not content and not image_path:
+            return
+        logger.info(
+            f"收到客户端聊天消息: session_id={session_id}, content_len={len(content)}"
+        )
+
+        adapter = None
+        for platform in self.context.platform_manager.platform_insts:
+            try:
+                meta = platform.meta()
+                if meta.name == "desktop_assistant":
+                    adapter = platform
+                    break
+            except Exception:
+                continue
+
+        if not adapter:
+            logger.warning("未找到 desktop_assistant 平台适配器，无法处理聊天消息")
+            return
+
+        sender_id = data.get("sender_id") or "desktop_user"
+        sender_name = data.get("sender_name") or "桌面用户"
+        selected_provider = data.get("selected_provider")
+        selected_model = data.get("selected_model")
+
+        try:
+            adapter.handle_user_message(
+                session_id=session_id,
+                text=content,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                selected_provider=selected_provider,
+                selected_model=selected_model,
+                image_path=image_path,
+            )
+        except Exception as e:
+            logger.error(f"处理客户端聊天消息失败: {e}")
     
     async def terminate(self):
         """插件终止时的清理操作"""
@@ -214,6 +383,29 @@ class Main(star.Star):
             logger.error(f"处理配置同步失败: {e}")
             import traceback
             traceback.print_exc()
+
+    def _validate_ws_token(self, token: str) -> bool:
+        """验证 WebSocket 连接的 token"""
+        if not token:
+            return False
+        token = token.removeprefix("Bearer ").strip()
+        if not token:
+            return False
+        if not self._jwt_secret:
+            logger.warning("JWT secret 未配置，跳过 WebSocket token 校验")
+            return True
+        try:
+            jwt.decode(token, self._jwt_secret, algorithms=["HS256"])
+            return True
+        except jwt.ExpiredSignatureError:
+            logger.warning("WebSocket token 已过期")
+            return False
+        except jwt.InvalidTokenError:
+            logger.warning("WebSocket token 无效")
+            return False
+        except Exception as e:
+            logger.error(f"WebSocket token 校验异常: {e}")
+            return False
     
     # ========================================================================
     # 命令处理器：远程截图
@@ -539,12 +731,14 @@ class DesktopAssistantAdapter(Platform):
         self.config = platform_config
         
         self._running = False
+        self._pending_replies: dict[str, float] = {}
+        self._pending_reply_ttl = 120.0
         
-        # 平台元数据
+        # 平台元数据 - ID 必须固定，确保 Context.send_message() 路由正确
         self.metadata = PlatformMetadata(
             name="desktop_assistant",
             description="桌面悬浮球助手",
-            id=platform_config.get("id", "desktop_assistant"),
+            id="desktop_assistant",  # 强制固定，不允许配置覆盖
         )
         
         # 会话 ID
@@ -566,6 +760,9 @@ class DesktopAssistantAdapter(Platform):
         message_chain: MessageChain,
     ):
         """通过会话发送消息"""
+        # 调试日志 - 验证分段消息路由
+        logger.debug(f"[send_by_session] platform_name={session.platform_name}, session_id={session.session_id}, content={str(message_chain)[:50]}...")
+        
         # 通过 WebSocket 发送消息到客户端
         try:
             msg_data = {
@@ -604,6 +801,10 @@ class DesktopAssistantAdapter(Platform):
             
     async def _start_monitor_services(self):
         """启动桌面监控和主动对话服务"""
+        client_manager.configure_screenshot_retention(
+            max_screenshots=self.config.get("max_screenshots"),
+            max_age_hours=self.config.get("screenshot_max_age_hours"),
+        )
         # 桌面监控服务（接收客户端上报的数据）
         if self.config.get("enable_desktop_monitor", True):
             self.desktop_monitor = DesktopMonitorService(
@@ -710,6 +911,71 @@ class DesktopAssistantAdapter(Platform):
         except Exception as e:
             logger.error(f"处理主动对话触发失败: {e}")
             logger.error(traceback.format_exc())
+
+    def handle_user_message(
+        self,
+        session_id: str,
+        text: str,
+        sender_id: str = "desktop_user",
+        sender_name: str = "桌面用户",
+        selected_provider: Optional[str] = None,
+        selected_model: Optional[str] = None,
+        image_path: Optional[str] = None,
+    ):
+        """处理客户端输入的文本消息"""
+        if not text and not image_path:
+            return
+
+        self._pending_replies[session_id] = time.time()
+        message_parts = []
+        if text:
+            message_parts.append(Plain(text))
+        if image_path:
+            message_parts.append(Image.fromFileSystem(image_path))
+
+        abm = AstrBotMessage()
+        abm.self_id = "desktop_assistant"
+        abm.sender = MessageMember(str(sender_id), sender_name)
+        abm.type = MessageType.FRIEND_MESSAGE
+        abm.session_id = session_id
+        abm.message_id = str(uuid.uuid4())
+        abm.timestamp = int(time.time())
+        abm.message = message_parts
+        if message_parts:
+            abm.message_str = _message_chain_to_text(MessageChain(message_parts)) or text or "[图片]"
+        else:
+            abm.message_str = text
+        abm.raw_message = {"source": "desktop_assistant_ws"}
+
+        msg_event = DesktopMessageEvent(
+            message_str=text,
+            message_obj=abm,
+            platform_meta=self.metadata,
+            session_id=session_id,
+            is_proactive=False,
+        )
+        
+        # 调试日志 - 确认 unified_msg_origin 的实际值
+        logger.info(f"[DesktopAssistant] unified_msg_origin={msg_event.unified_msg_origin}, platform_meta.id={self.metadata.id}")
+
+        if selected_provider:
+            msg_event.set_extra("selected_provider", selected_provider)
+        if selected_model:
+            msg_event.set_extra("selected_model", selected_model)
+
+        self.commit_event(msg_event)
+
+    def _has_pending_reply(self, session_id: str) -> bool:
+        ts = self._pending_replies.get(session_id)
+        if not ts:
+            return False
+        if time.time() - ts > self._pending_reply_ttl:
+            self._pending_replies.pop(session_id, None)
+            return False
+        return True
+
+    def _clear_pending_reply(self, session_id: str) -> None:
+        self._pending_replies.pop(session_id, None)
             
     async def terminate(self):
         """终止适配器"""

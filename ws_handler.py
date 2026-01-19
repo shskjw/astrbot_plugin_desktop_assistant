@@ -144,6 +144,10 @@ class ClientManager:
         # 截图保存目录
         self._screenshot_save_dir = "./temp/remote_screenshots"
         os.makedirs(self._screenshot_save_dir, exist_ok=True)
+
+        # 截图保留策略
+        self._max_screenshots = 20
+        self._screenshot_max_age_hours = 24
         
         # WebSocket 服务器引用（由 main.py 设置）
         self._ws_server = None
@@ -194,9 +198,12 @@ class ClientManager:
                     break
                 
                 cleaned_count = self._cleanup_expired_requests()
+                cleaned_files = self._cleanup_screenshot_files()
                 
                 if cleaned_count > 0:
                     logger.info(f"已清理 {cleaned_count} 个过期截图请求")
+                if cleaned_files > 0:
+                    logger.info(f"??? {cleaned_files} ???????")
                     
             except asyncio.CancelledError:
                 break
@@ -244,6 +251,67 @@ class ClientManager:
             )
         
         return cleaned_count
+
+    def configure_screenshot_retention(
+        self,
+        max_screenshots: Optional[int] = None,
+        max_age_hours: Optional[int] = None,
+    ):
+        """配置截图保留策略"""
+        if max_screenshots is not None:
+            try:
+                self._max_screenshots = max(0, int(max_screenshots))
+            except (TypeError, ValueError):
+                logger.warning(f"无效的 max_screenshots 配置: {max_screenshots}")
+        if max_age_hours is not None:
+            try:
+                self._screenshot_max_age_hours = max(0, int(max_age_hours))
+            except (TypeError, ValueError):
+                logger.warning(f"无效的 screenshot_max_age_hours 配置: {max_age_hours}")
+
+    def _cleanup_screenshot_files(self) -> int:
+        """清理截图文件"""
+        if not os.path.isdir(self._screenshot_save_dir):
+            return 0
+        if self._max_screenshots <= 0 and self._screenshot_max_age_hours <= 0:
+            return 0
+
+        now = time.time()
+        max_age_seconds = self._screenshot_max_age_hours * 3600
+        entries = []
+        for name in os.listdir(self._screenshot_save_dir):
+            path = os.path.join(self._screenshot_save_dir, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                entries.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+
+        removed = 0
+        if self._screenshot_max_age_hours > 0:
+            for mtime, path in entries:
+                if now - mtime > max_age_seconds:
+                    try:
+                        os.remove(path)
+                        removed += 1
+                    except OSError as e:
+                        logger.debug(f"删除截图失败: {path} ({e})")
+
+        if self._max_screenshots > 0:
+            remaining = [(mtime, path) for mtime, path in entries if os.path.exists(path)]
+            if len(remaining) > self._max_screenshots:
+                remaining.sort(key=lambda item: item[0])
+                over_limit = len(remaining) - self._max_screenshots
+                for _, path in remaining[:over_limit]:
+                    try:
+                        os.remove(path)
+                        removed += 1
+                    except OSError as e:
+                        logger.debug(f"删除截图失败: {path} ({e})")
+
+        return removed
+
     
     def get_active_clients_count(self) -> int:
         """获取活跃客户端数量"""
@@ -382,6 +450,30 @@ class ClientManager:
         self.client_states[session_id] = state
         logger.debug(f"客户端桌面状态已更新: session_id={session_id}, window={state.active_window_title}")
         return state
+
+    def save_base64_image(self, base64_data: str, filename_prefix: str = "ws_upload") -> Optional[str]:
+        """保存 Base64 图片到本地文件，返回文件路径"""
+        if not base64_data:
+            return None
+        data = base64_data.strip()
+        if data.startswith("data:"):
+            parts = data.split(",", 1)
+            if len(parts) == 2:
+                data = parts[1]
+        try:
+            image_bytes = base64.b64decode(data)
+        except Exception as e:
+            logger.error(f"Base64 图片解码失败: {e}")
+            return None
+        filename = f"{filename_prefix}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.png"
+        filepath = os.path.join(self._screenshot_save_dir, filename)
+        try:
+            with open(filepath, "wb") as f:
+                f.write(image_bytes)
+        except Exception as e:
+            logger.error(f"保存图片失败: {e}")
+            return None
+        return filepath
     
     def remove_client_state(self, session_id: str):
         """移除客户端状态（客户端断开时调用）"""
@@ -685,6 +777,8 @@ class MessageHandler:
         
         # 配置同步回调（由 main.py 设置）
         self.on_config_sync: Optional[Callable[[str, dict], Any]] = None
+        # 客户端聊天消息回调（由 main.py 设置）
+        self.on_chat_message: Optional[Callable[[str, dict], Any]] = None
     
     async def handle_message(self, session_id: str, data: dict):
         """
@@ -716,6 +810,10 @@ class MessageHandler:
         elif msg_type == "config_sync":
             # 处理客户端配置同步
             await self._handle_config_sync(session_id, data)
+                
+        elif msg_type == "chat_message":
+            # 处理客户端聊天消息
+            await self._handle_chat_message(session_id, data)
                 
         elif msg_type == "state_sync":
             # 处理客户端状态同步（保留向后兼容）
@@ -772,6 +870,22 @@ class MessageHandler:
             "type": "config_sync_ack",
             "success": True,
         })
+
+    async def _handle_chat_message(self, session_id: str, data: dict):
+        """
+        处理客户端聊天消息
+
+        Args:
+            session_id: 客户端会话 ID
+            data: 聊天数据
+        """
+        if self.on_chat_message:
+            try:
+                result = self.on_chat_message(session_id, data)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.error(f"聊天消息回调执行失败: {e}")
     
     def on_client_connect(self, session_id: str):
         """客户端连接回调"""

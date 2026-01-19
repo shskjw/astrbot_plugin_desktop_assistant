@@ -15,5 +15,29 @@
         "hint": "当识图模式为 dedicated 时生效，填写支持多模态的 LLM Provider ID（如 openai_gpt4o）",
         "type": "string",
         "default": ""
+    },
+    "ws_host": {
+        "description": "WebSocket 监听地址",
+        "hint": "默认 0.0.0.0 监听所有网卡",
+        "type": "string",
+        "default": "0.0.0.0"
+    },
+    "ws_port": {
+        "description": "WebSocket 端口",
+        "hint": "提供客户端连接的 WebSocket 端口",
+        "type": "int",
+        "default": 6190
+    },
+    "max_screenshots": {
+        "description": "截图最大保留数量",
+        "hint": "超过上限会自动清理最早的截图，0 表示不限制",
+        "type": "int",
+        "default": 20
+    },
+    "screenshot_max_age_hours": {
+        "description": "截图最大保留时长(小时)",
+        "hint": "超过时长自动清理，0 表示不限制",
+        "type": "int",
+        "default": 24
     }
 }

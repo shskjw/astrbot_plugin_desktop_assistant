@@ -61,6 +61,7 @@ class StandaloneWebSocketServer:
         on_client_connect: Optional[Callable[[str], Any]] = None,
         on_client_disconnect: Optional[Callable[[str], Any]] = None,
         on_message: Optional[Callable[[str, dict], Any]] = None,
+        token_validator: Optional[Callable[[str], bool]] = None,
     ):
         """
         初始化 WebSocket 服务器
@@ -77,6 +78,7 @@ class StandaloneWebSocketServer:
         self.on_client_connect = on_client_connect
         self.on_client_disconnect = on_client_disconnect
         self.on_message = on_message
+        self._token_validator = token_validator
         
         # 活跃连接: session_id -> websocket
         self.connections: Dict[str, WebSocketServerProtocol] = {}
@@ -262,7 +264,16 @@ class StandaloneWebSocketServer:
             await websocket.close(1008, "Missing session_id or token")
             return
         
-        # TODO: 验证 token 有效性（当前信任本地连接）
+        if self._token_validator:
+            try:
+                if not self._token_validator(token):
+                    logger.warning("WebSocket 连接拒绝: token 无效或过期")
+                    await websocket.close(1008, "Invalid token")
+                    return
+            except Exception as e:
+                logger.error(f"WebSocket token 验证失败: {e}")
+                await websocket.close(1011, "Token validation error")
+                return
         
         # 记录连接和活跃时间
         import time
@@ -572,9 +583,12 @@ class StandaloneWebSocketServer:
         Returns:
             是否发送成功
         """
+        # 调试日志：打印当前所有连接
+        logger.debug(f"[发送调试] 尝试发送到 session_id={session_id}, 当前连接数={len(self.connections)}, 连接列表={list(self.connections.keys())}")
+        
         websocket = self.connections.get(session_id)
         if not websocket:
-            logger.warning(f"发送失败: 客户端未连接 session_id={session_id}")
+            logger.warning(f"发送失败: 客户端未连接 session_id={session_id}, 当前连接={list(self.connections.keys())}")
             return False
         
         return await self._send_json(websocket, data)
