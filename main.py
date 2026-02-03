@@ -681,7 +681,7 @@ class DesktopMessageEvent(AstrMessageEvent):
         try:
             msg_data = {
                 "type": "message",
-                "content": str(message),  # 暂时转换为字符串，后续优化为结构化数据
+                "content": _message_chain_to_text(message),  # 暂时转换为字符串，后续优化为结构化数据
                 "session_id": self.session_id
             }
             # 尝试直接发送给对应的 session
@@ -767,7 +767,7 @@ class DesktopAssistantAdapter(Platform):
         try:
             msg_data = {
                 "type": "message",
-                "content": str(message_chain),
+                "content": _message_chain_to_text(message_chain),
                 "session_id": session.session_id
             }
             await client_manager.send_message(session.session_id, msg_data)
